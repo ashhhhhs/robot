@@ -21,6 +21,7 @@
 #include "driver/i2s.h"
 #include "esp_board_init.h"
 #include "hw_config.h"
+#include <unistd.h>
 
 static const i2s_port_t s_i2s_port = INMP441_I2S_PORT;
 

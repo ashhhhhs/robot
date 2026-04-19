@@ -1,441 +1,383 @@
 /*
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
+ * Robot Dog - Enhanced Personality Engine
+ *
+ * Features:
+ *  - Finite State Machine (IDLE, PETTED, DANCING, EXCITED, SLEEPING)
+ *  - Gesture detection: tap, long-press (triggers dance), double-tap (excited)
+ *  - Auto-sleep after configurable idle timeout
+ *  - Random idle blink animations
+ *  - Richer personality sounds (chirp, whimper, snore, excited bark)
+ *  - Graceful task shutdown with event groups
+ */
 
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "oled.h"
 #include "buzzer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/event_groups.h"
 #include "esp_log.h"
+#include "esp_random.h"
+#include "driver/touch_pad.h"
 
-#include "esp_wn_iface.h"
-#include "esp_wn_models.h"
-#include "esp_afe_sr_iface.h"
-#include "esp_afe_sr_models.h"
-#include "esp_mn_iface.h"
-#include "esp_mn_models.h"
-#include "esp_board_init.h"
 #include "speech_commands_action.h"
 #include "servo.h"
 
+// ─────────────────────────────────────────────
+//  Configuration
+// ─────────────────────────────────────────────
 static const char *TAG = "ROBOT_DOG";
 
-static const char *command_names[] = {
-    "GOOD BOY",
-    "SIT DOWN",
-    "LIE DOWN",
-    "STRETCH",
-    "WALK",
-    "DANCE"
-};
+#define TOUCH_PAD_NUM        TOUCH_PAD_NUM9
+#define TOUCH_THRESHOLD      400     // Lower = more sensitive
+#define LONG_PRESS_MS        800     // Hold duration to trigger dance
+#define DOUBLE_TAP_WINDOW_MS 350     // Max gap between taps for double-tap
+#define SLEEP_TIMEOUT_MS     15000   // Idle time before dog falls asleep
+#define BLINK_INTERVAL_MIN   3000    // Minimum ms between random blinks
+#define BLINK_INTERVAL_MAX   7000    // Maximum ms between random blinks
+#define BLINK_DURATION_MS    120     // How long a blink lasts
+#define TOUCH_POLL_MS        50      // Touch polling interval
 
-#define CMD_GOOD_BOY 0
-#define CMD_SIT_DOWN 1
-#define CMD_LIE_DOWN 2
-#define CMD_STRETCH 3
-#define CMD_WALK 4
-#define CMD_DANCE 5
-#define NUM_COMMANDS 6
+// ─────────────────────────────────────────────
+//  Commands (servo task protocol)
+// ─────────────────────────────────────────────
+typedef enum {
+    CMD_GOOD_BOY = 0,
+    CMD_DANCE    = 5,
+    CMD_EXCITED  = 10,
+} servo_cmd_t;
 
-// State variables
-static volatile int task_flag = 0;
-static volatile int feed_task_running = 0;
-static volatile int detect_task_running = 0;
+// ─────────────────────────────────────────────
+//  Robot States
+// ─────────────────────────────────────────────
+typedef enum {
+    STATE_IDLE,
+    STATE_PETTED,
+    STATE_DANCING,
+    STATE_EXCITED,
+    STATE_SLEEPING,
+} robot_state_t;
 
-// Global resources
-static int wakeup_flag = 0;
-static const esp_afe_sr_iface_t *afe_handle = NULL;
-static srmodel_list_t *models = NULL;
-static QueueHandle_t servo_cmd_queue = NULL;
-static esp_afe_sr_data_t *global_afe_data = NULL;
-static model_iface_data_t *global_model_data = NULL;
-static esp_mn_iface_t *global_multinet = NULL;
+// ─────────────────────────────────────────────
+//  OLED face strings
+// ─────────────────────────────────────────────
+typedef struct {
+    const char *top;
+    const char *bottom;
+} oled_face_t;
 
-void feed_Task(void *arg)
+static const oled_face_t FACE_IDLE     = { "  ^ _ ^  ", "   Idle   " };
+static const oled_face_t FACE_HAPPY    = { "  > w <  ", " Good Boy! " };
+static const oled_face_t FACE_BLINK    = { "  - _ -  ", "   Idle   " };
+static const oled_face_t FACE_EXCITED  = { "  ^O^!!  ", "  Excited! " };
+static const oled_face_t FACE_DANCE    = { "  >  <   ", "  Dancing! " };
+static const oled_face_t FACE_SLEEP    = { "  -_- zz ", "  Sleeping " };
+static const oled_face_t FACE_WAKE     = { "  o _ o  ", " Waking up!" };
+static const oled_face_t FACE_SNIFF    = { "  ^ . ^  ", "  *sniff*  " };
+
+// ─────────────────────────────────────────────
+//  Shared state
+// ─────────────────────────────────────────────
+static volatile robot_state_t current_state   = STATE_IDLE;
+static volatile TickType_t    last_activity   = 0;
+static QueueHandle_t          servo_cmd_queue = NULL;
+static EventGroupHandle_t     task_evt_group  = NULL;
+
+#define EVT_SHUTDOWN BIT0
+
+// ─────────────────────────────────────────────
+//  Helper: Show face
+// ─────────────────────────────────────────────
+static void show_face(const oled_face_t *f)
 {
-    esp_afe_sr_data_t *afe_data = arg;
-    feed_task_running = 1;
-    
-    // Validate input
-    if (!afe_data || !afe_handle) {
-        ESP_LOGE(TAG, "feed_Task: invalid afe_data or afe_handle");
-        feed_task_running = 0;
-        vTaskDelete(NULL);
-        return;
+    oled_display_text(f->top, f->bottom);
+}
+
+// ─────────────────────────────────────────────
+//  Personality Sounds
+// ─────────────────────────────────────────────
+static void play_boot_sound(void)
+{
+    buzzer_beep(600, 80);
+    vTaskDelay(40 / portTICK_PERIOD_MS);
+    buzzer_beep(900, 80);
+    vTaskDelay(40 / portTICK_PERIOD_MS);
+    buzzer_beep(1200, 80);
+    vTaskDelay(40 / portTICK_PERIOD_MS);
+    buzzer_beep(1600, 150);
+}
+
+static void play_happy_chirp(void)
+{
+    buzzer_beep(1500, 60);
+    vTaskDelay(30 / portTICK_PERIOD_MS);
+    buzzer_beep(2000, 100);
+    vTaskDelay(30 / portTICK_PERIOD_MS);
+    buzzer_beep(1800, 80);
+}
+
+static void play_excited_bark(void)
+{
+    for (int i = 0; i < 3; i++) {
+        buzzer_beep(900, 60);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+        buzzer_beep(700, 60);
+        vTaskDelay(80 / portTICK_PERIOD_MS);
     }
+}
 
-    int audio_chunksize = afe_handle->get_feed_chunksize(afe_data);
-    int nch = afe_handle->get_feed_channel_num(afe_data);
-    int feed_channel = esp_get_feed_channel();
-    
-    if (nch != feed_channel) {
-        ESP_LOGE(TAG, "feed_Task: channel mismatch - nch:%d vs feed_channel:%d", nch, feed_channel);
-        feed_task_running = 0;
-        vTaskDelete(NULL);
-        return;
+static void play_dance_fanfare(void)
+{
+    const int notes[] = { 523, 659, 784, 1047 };  // C5 E5 G5 C6
+    for (int i = 0; i < 4; i++) {
+        buzzer_beep(notes[i], 100);
+        vTaskDelay(40 / portTICK_PERIOD_MS);
     }
+}
 
-    int16_t *i2s_buff = malloc(audio_chunksize * sizeof(int16_t) * feed_channel);
-    if (!i2s_buff) {
-        ESP_LOGE(TAG, "feed_Task: malloc failed for i2s_buff");
-        feed_task_running = 0;
-        vTaskDelete(NULL);
-        return;
+static void play_sleep_sound(void)
+{
+    buzzer_beep(400, 200);
+    vTaskDelay(300 / portTICK_PERIOD_MS);
+    buzzer_beep(300, 300);
+}
+
+static void play_wake_sound(void)
+{
+    buzzer_beep(500, 80);
+    vTaskDelay(60 / portTICK_PERIOD_MS);
+    buzzer_beep(800, 120);
+}
+
+// ─────────────────────────────────────────────
+//  State Transitions
+// ─────────────────────────────────────────────
+static void enter_state(robot_state_t new_state)
+{
+    if (current_state == new_state) return;
+
+    ESP_LOGI(TAG, "State: %d -> %d", current_state, new_state);
+    current_state  = new_state;
+    last_activity  = xTaskGetTickCount();
+}
+
+static void send_servo_cmd(servo_cmd_t cmd)
+{
+    int c = (int)cmd;
+    if (xQueueSend(servo_cmd_queue, &c, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Servo queue full — command dropped");
     }
+}
 
-    ESP_LOGI(TAG, "feed_Task started - chunksize:%d, channels:%d", audio_chunksize, nch);
+// ─────────────────────────────────────────────
+//  Touch Task  (gesture detector)
+// ─────────────────────────────────────────────
+void touch_Task(void *arg)
+{
+    uint16_t touch_val;
+    bool     is_touched       = false;
+    bool     was_touched      = false;
+    TickType_t press_start    = 0;
+    TickType_t last_tap_tick  = 0;
+    bool     long_press_fired = false;
 
-    while (task_flag && feed_task_running)
-    {
-        esp_err_t ret = esp_get_feed_data(true, i2s_buff, audio_chunksize * sizeof(int16_t) * feed_channel);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "feed_Task: esp_get_feed_data failed - 0x%x", ret);
-            break;
+    ESP_LOGI(TAG, "Touch task started (GPIO32 / TOUCH_PAD_NUM9)");
+
+    while (!(xEventGroupGetBits(task_evt_group) & EVT_SHUTDOWN)) {
+        touch_pad_read(TOUCH_PAD_NUM, &touch_val);
+        is_touched = (touch_val < TOUCH_THRESHOLD);
+
+        // ── Wake from sleep on any touch ──
+        if (is_touched && current_state == STATE_SLEEPING) {
+            play_wake_sound();
+            show_face(&FACE_WAKE);
+            vTaskDelay(600 / portTICK_PERIOD_MS);
+            enter_state(STATE_IDLE);
+            show_face(&FACE_IDLE);
+            was_touched = true;
+            vTaskDelay(TOUCH_POLL_MS / portTICK_PERIOD_MS);
+            continue;
         }
 
-        afe_handle->feed(afe_data, i2s_buff);
+        // ── Ignore gestures during servo animations ──
+        if (current_state == STATE_DANCING || current_state == STATE_EXCITED) {
+            was_touched = is_touched;
+            vTaskDelay(TOUCH_POLL_MS / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        // ── Rising edge: touch started ──
+        if (is_touched && !was_touched) {
+            press_start    = xTaskGetTickCount();
+            long_press_fired = false;
+        }
+
+        // ── Held: check for long-press ──
+        if (is_touched && was_touched && !long_press_fired) {
+            TickType_t held_ms = pdTICKS_TO_MS(xTaskGetTickCount() - press_start);
+            if (held_ms >= LONG_PRESS_MS) {
+                long_press_fired = true;
+                ESP_LOGI(TAG, "Gesture: LONG PRESS -> DANCE");
+                enter_state(STATE_DANCING);
+                show_face(&FACE_DANCE);
+                play_dance_fanfare();
+                send_servo_cmd(CMD_DANCE);
+            }
+        }
+
+        // ── Falling edge: touch released ──
+        if (!is_touched && was_touched && !long_press_fired) {
+            TickType_t now     = xTaskGetTickCount();
+            TickType_t gap_ms  = pdTICKS_TO_MS(now - last_tap_tick);
+
+            if (last_tap_tick != 0 && gap_ms <= DOUBLE_TAP_WINDOW_MS) {
+                // Double tap → Excited!
+                ESP_LOGI(TAG, "Gesture: DOUBLE TAP -> EXCITED");
+                last_tap_tick = 0;
+                enter_state(STATE_EXCITED);
+                show_face(&FACE_EXCITED);
+                play_excited_bark();
+                send_servo_cmd(CMD_EXCITED);
+            } else {
+                // Single tap → Good Boy
+                ESP_LOGI(TAG, "Gesture: SINGLE TAP -> PETTED");
+                last_tap_tick = now;
+                enter_state(STATE_PETTED);
+                show_face(&FACE_HAPPY);
+                play_happy_chirp();
+                send_servo_cmd(CMD_GOOD_BOY);
+            }
+        }
+
+        was_touched = is_touched;
+        vTaskDelay(TOUCH_POLL_MS / portTICK_PERIOD_MS);
     }
 
-    if (i2s_buff) {
-        free(i2s_buff);
-        i2s_buff = NULL;
-    }
-
-    ESP_LOGI(TAG, "feed_Task exiting");
-    feed_task_running = 0;
+    ESP_LOGI(TAG, "Touch task shutting down");
     vTaskDelete(NULL);
 }
 
-void detect_Task(void *arg)
-{
-    esp_afe_sr_data_t *afe_data = arg;
-    detect_task_running = 1;
-
-    // Validate inputs
-    if (!afe_data || !afe_handle || !models) {
-        ESP_LOGE(TAG, "detect_Task: invalid inputs - afe_data:%p, afe_handle:%p, models:%p", 
-                 afe_data, afe_handle, models);
-        detect_task_running = 0;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    int afe_chunksize = afe_handle->get_fetch_chunksize(afe_data);
-    
-    // Get model name with error check
-    char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
-    if (!mn_name) {
-        ESP_LOGE(TAG, "detect_Task: Failed to find model");
-        oled_display_text("Error", "No model found");
-        detect_task_running = 0;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "detect_Task: multinet model: %s", mn_name);
-
-    // Get multinet handle with error check
-    esp_mn_iface_t *multinet = esp_mn_handle_from_name(mn_name);
-    if (!multinet) {
-        ESP_LOGE(TAG, "detect_Task: Failed to get multinet handle");
-        oled_display_text("Error", "Init failed");
-        detect_task_running = 0;
-        vTaskDelete(NULL);
-        return;
-    }
-    global_multinet = multinet;
-
-    // Create model data with error check
-    model_iface_data_t *model_data = multinet->create(mn_name, 6000);
-    if (!model_data) {
-        ESP_LOGE(TAG, "detect_Task: Failed to create model data");
-        oled_display_text("Error", "Model create");
-        detect_task_running = 0;
-        vTaskDelete(NULL);
-        return;
-    }
-    global_model_data = model_data;
-
-    int mu_chunksize = multinet->get_samp_chunksize(model_data);
-    if (mu_chunksize != afe_chunksize) {
-        ESP_LOGE(TAG, "detect_Task: chunksize mismatch - mu:%d vs afe:%d", mu_chunksize, afe_chunksize);
-        multinet->destroy(model_data);
-        oled_display_text("Error", "Chunksize");
-        detect_task_running = 0;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    esp_mn_commands_update_from_sdkconfig(multinet, model_data);
-    multinet->print_active_speech_commands(model_data);
-
-    ESP_LOGI(TAG, "detect_Task started");
-    oled_display_text("Ready", "Say wakeword");
-
-    while (task_flag && detect_task_running)
-    {
-        afe_fetch_result_t *res = afe_handle->fetch(afe_data);
-        if (!res || res->ret_value == ESP_FAIL)
-        {
-            ESP_LOGE(TAG, "detect_Task: fetch error");
-            break;
-        }
-
-        if (res->wakeup_state == WAKENET_DETECTED)
-        {
-            ESP_LOGI(TAG, "WAKEWORD DETECTED");
-            buzzer_beep(1500, 80);
-            oled_display_text("Wakeword", "Listening...");
-            multinet->clean(model_data);
-        }
-
-        if (res->raw_data_channels == 1 && res->wakeup_state == WAKENET_DETECTED)
-        {
-            wakeup_flag = 1;
-        }
-        else if (res->raw_data_channels > 1 && res->wakeup_state == WAKENET_CHANNEL_VERIFIED)
-        {
-            ESP_LOGI(TAG, "AFE_FETCH_CHANNEL_VERIFIED, channel index: %d", res->trigger_channel_id);
-            wakeup_flag = 1;
-        }
-
-        if (wakeup_flag == 1)
-        {
-            esp_mn_state_t mn_state = multinet->detect(model_data, res->data);
-
-            if (mn_state == ESP_MN_STATE_DETECTING)
-            {
-                continue;
-            }
-
-            if (mn_state == ESP_MN_STATE_DETECTED)
-            {
-                esp_mn_results_t *mn_result = multinet->get_results(model_data);
-                if (mn_result) {
-                    for (int i = 0; i < mn_result->num; i++)
-                    {
-                        ESP_LOGI(TAG, "TOP %d, command_id: %d, phrase_id: %d, string: %s, prob: %f",
-                               i + 1, mn_result->command_id[i], mn_result->phrase_id[i], 
-                               mn_result->string, mn_result->prob[i]);
-                    }
-
-                    int cmd_id = mn_result->command_id[0];
-                    if (cmd_id >= 0 && cmd_id < NUM_COMMANDS) {
-                        oled_display_text("Command", command_names[cmd_id]);
-                        buzzer_beep(1200 + cmd_id * 100, 120);
-                    } else {
-                        oled_display_text("Command", "Unknown");
-                    }
-
-                    // Send with timeout to prevent queue overflow
-                    if (xQueueSend(servo_cmd_queue, &cmd_id, pdMS_TO_TICKS(100)) != pdTRUE) {
-                        ESP_LOGW(TAG, "detect_Task: Queue send failed (full?)");
-                    }
-
-                    ESP_LOGI(TAG, "Command sent to servo queue");
-                }
-            }
-
-            if (mn_state == ESP_MN_STATE_TIMEOUT)
-            {
-                esp_mn_results_t *mn_result = multinet->get_results(model_data);
-                if (mn_result) {
-                    ESP_LOGW(TAG, "Timeout, string: %s", mn_result->string);
-                }
-                oled_display_text("Timeout", "Say wakeword");
-                afe_handle->enable_wakenet(afe_data);
-                wakeup_flag = 0;
-            }
-        }
-    }
-
-    if (model_data && multinet) {
-        multinet->destroy(model_data);
-        global_model_data = NULL;
-    }
-
-    ESP_LOGI(TAG, "detect_Task exiting");
-    detect_task_running = 0;
-    vTaskDelete(NULL);
-}
-
+// ─────────────────────────────────────────────
+//  Servo Task
+// ─────────────────────────────────────────────
 void servo_Task(void *arg)
 {
     int cmd_id;
-    ESP_LOGI(TAG, "servo_Task started");
-    
-    while (task_flag)
-    {
-        // Block here until a command arrives — no CPU waste
-        if (xQueueReceive(servo_cmd_queue, &cmd_id, pdMS_TO_TICKS(500)))
-        {
-            ESP_LOGI(TAG, "servo_Task received command: %d", cmd_id);
-            
-            // Validate command ID
-            if (cmd_id < 0 || cmd_id >= NUM_COMMANDS) {
-                ESP_LOGW(TAG, "servo_Task: invalid command ID %d", cmd_id);
-                oled_display_text("Error", "Invalid cmd");
-                continue;
+
+    while (!(xEventGroupGetBits(task_evt_group) & EVT_SHUTDOWN)) {
+        if (xQueueReceive(servo_cmd_queue, &cmd_id, pdMS_TO_TICKS(200)) == pdTRUE) {
+            ESP_LOGI(TAG, "Servo executing cmd: %d", cmd_id);
+
+            switch ((servo_cmd_t)cmd_id) {
+                case CMD_GOOD_BOY: anim_good_boy(); break;
+                case CMD_DANCE:    anim_dance();    break;
+                case CMD_EXCITED:  anim_good_boy(); anim_good_boy(); break;
+                default:
+                    ESP_LOGW(TAG, "Unknown servo cmd: %d", cmd_id);
+                    break;
             }
 
-            oled_display_text("Executing", command_names[cmd_id]);
-
-            switch (cmd_id)
-            {
-            case CMD_GOOD_BOY:
-                ESP_LOGI(TAG, "Executing: GOOD BOY");
-                anim_good_boy();
-                break;
-            case CMD_SIT_DOWN:
-                ESP_LOGI(TAG, "Executing: SIT DOWN");
-                anim_sit_down();
-                break;
-            case CMD_LIE_DOWN:
-                ESP_LOGI(TAG, "Executing: LIE DOWN");
-                anim_lie_down();
-                break;
-            case CMD_STRETCH:
-                ESP_LOGI(TAG, "Executing: STRETCH");
-                anim_stretch();
-                break;
-            case CMD_WALK:
-                ESP_LOGI(TAG, "Executing: WALK");
-                anim_walk();
-                break;
-            case CMD_DANCE:
-                ESP_LOGI(TAG, "Executing: DANCE");
-                anim_dance();
-                break;
-            default:
-                ESP_LOGW(TAG, "servo_Task: unhandled command %d", cmd_id);
-                break;
+            // Return to idle after animation completes
+            if (current_state != STATE_SLEEPING) {
+                enter_state(STATE_IDLE);
+                show_face(&FACE_IDLE);
             }
-            
-            oled_display_text("Ready", "Say wakeword");
         }
     }
-    
-    ESP_LOGI(TAG, "servo_Task exiting");
+
+    ESP_LOGI(TAG, "Servo task shutting down");
     vTaskDelete(NULL);
 }
 
-void app_main()
+// ─────────────────────────────────────────────
+//  Idle Manager Task (sleep + blink animations)
+// ─────────────────────────────────────────────
+void idle_Task(void *arg)
+{
+    TickType_t next_blink = xTaskGetTickCount() +
+                            pdMS_TO_TICKS(BLINK_INTERVAL_MIN + (esp_random() % (BLINK_INTERVAL_MAX - BLINK_INTERVAL_MIN)));
+
+    ESP_LOGI(TAG, "Idle manager task started");
+
+    while (!(xEventGroupGetBits(task_evt_group) & EVT_SHUTDOWN)) {
+        TickType_t now    = xTaskGetTickCount();
+        TickType_t idle_ms = pdTICKS_TO_MS(now - last_activity);
+
+        // ── Auto-sleep ──
+        if (current_state == STATE_IDLE && idle_ms >= SLEEP_TIMEOUT_MS) {
+            ESP_LOGI(TAG, "Idle timeout — going to sleep");
+            enter_state(STATE_SLEEPING);
+            servo_all_neutral();
+            play_sleep_sound();
+            show_face(&FACE_SLEEP);
+        }
+
+        // ── Periodic blink (only while idle) ──
+        if (current_state == STATE_IDLE && now >= next_blink) {
+            show_face(&FACE_BLINK);
+            vTaskDelay(BLINK_DURATION_MS / portTICK_PERIOD_MS);
+            show_face(&FACE_IDLE);
+
+            // Occasionally show a sniff animation
+            if ((esp_random() % 4) == 0) {
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+                show_face(&FACE_SNIFF);
+                vTaskDelay(400 / portTICK_PERIOD_MS);
+                show_face(&FACE_IDLE);
+            }
+
+            // Schedule next blink with random interval
+            next_blink = now + pdMS_TO_TICKS(
+                BLINK_INTERVAL_MIN + (esp_random() % (BLINK_INTERVAL_MAX - BLINK_INTERVAL_MIN))
+            );
+        }
+
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+    }
+
+    ESP_LOGI(TAG, "Idle task shutting down");
+    vTaskDelete(NULL);
+}
+
+// ─────────────────────────────────────────────
+//  Entry Point
+// ─────────────────────────────────────────────
+void app_main(void)
 {
     ESP_LOGI(TAG, "=== Robot Dog Booting ===");
 
-    // Initialize peripherals
-    ESP_LOGI(TAG, "Initializing buzzer...");
-    buzzer_init();
-    
-    ESP_LOGI(TAG, "Initializing OLED...");
-    oled_init();
-    oled_display_text("Robot Dog", "Booting...");
+    // Init touch FIRST to avoid I2C bus collision with OLED
+    ESP_ERROR_CHECK(touch_pad_init());
+    ESP_ERROR_CHECK(touch_pad_config(TOUCH_PAD_NUM, 0));
 
-    ESP_LOGI(TAG, "Initializing servos...");
+    buzzer_init();
+    oled_init();
+
+    show_face(&FACE_WAKE);
+    play_boot_sound();
+
     servo_init();
     servo_all_neutral();
 
-    // Create queue for servo commands
+    // Shared resources
     servo_cmd_queue = xQueueCreate(5, sizeof(int));
-    if (!servo_cmd_queue) {
-        ESP_LOGE(TAG, "Failed to create servo command queue");
-        oled_display_text("Error", "Queue create");
-        return;
-    }
+    task_evt_group  = xEventGroupCreate();
+    configASSERT(servo_cmd_queue);
+    configASSERT(task_evt_group);
 
-    // Load speech recognition models
-    ESP_LOGI(TAG, "Loading speech models...");
-    models = esp_srmodel_init("model");
-    if (!models) {
-        ESP_LOGE(TAG, "Failed to initialize models");
-        oled_display_text("Error", "Model load");
-        vQueueDelete(servo_cmd_queue);
-        servo_cmd_queue = NULL;
-        return;
-    }
+    last_activity = xTaskGetTickCount();
 
-    // Initialize board (I2S audio)
-    ESP_LOGI(TAG, "Initializing I2S audio...");
-    esp_err_t ret = esp_board_init(16000, 2, 16);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize board: 0x%x", ret);
-        oled_display_text("Error", "I2S init fail");
-        vQueueDelete(servo_cmd_queue);
-        servo_cmd_queue = NULL;
-        return;
-    }
+    // Spawn tasks
+    xTaskCreatePinnedToCore(servo_Task, "servo", 4 * 1024, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(touch_Task, "touch", 4 * 1024, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(idle_Task,  "idle",  3 * 1024, NULL, 3, NULL, 1);
 
-    // Initialize AFE (Audio Front End)
-    ESP_LOGI(TAG, "Initializing audio front end...");
-    afe_config_t *afe_config = afe_config_init(esp_get_input_format(), models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
-    if (!afe_config) {
-        ESP_LOGE(TAG, "Failed to initialize AFE config");
-        oled_display_text("Error", "AFE config");
-        vQueueDelete(servo_cmd_queue);
-        servo_cmd_queue = NULL;
-        return;
-    }
-
-    afe_handle = esp_afe_handle_from_config(afe_config);
-    if (!afe_handle) {
-        ESP_LOGE(TAG, "Failed to get AFE handle");
-        afe_config_free(afe_config);
-        oled_display_text("Error", "AFE handle");
-        vQueueDelete(servo_cmd_queue);
-        servo_cmd_queue = NULL;
-        return;
-    }
-
-    global_afe_data = afe_handle->create_from_config(afe_config);
-    if (!global_afe_data) {
-        ESP_LOGE(TAG, "Failed to create AFE data");
-        afe_config_free(afe_config);
-        oled_display_text("Error", "AFE data");
-        vQueueDelete(servo_cmd_queue);
-        servo_cmd_queue = NULL;
-        return;
-    }
-
-    afe_config_free(afe_config);
-
-    // Start task flag
-    task_flag = 1;
-
-    // Create tasks on separate cores for better performance
-    ESP_LOGI(TAG, "Creating tasks...");
-    
-    BaseType_t ret_detect = xTaskCreatePinnedToCore(
-        &detect_Task, "detect", 8 * 1024, (void *)global_afe_data, 5, NULL, 1);
-    if (ret_detect != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create detect task");
-        task_flag = 0;
-        oled_display_text("Error", "Task create");
-        return;
-    }
-
-    BaseType_t ret_feed = xTaskCreatePinnedToCore(
-        &feed_Task, "feed", 8 * 1024, (void *)global_afe_data, 5, NULL, 0);
-    if (ret_feed != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create feed task");
-        task_flag = 0;
-        oled_display_text("Error", "Feed task");
-        return;
-    }
-
-    BaseType_t ret_servo = xTaskCreatePinnedToCore(
-        servo_Task, "servo", 4 * 1024, NULL, 5, NULL, 0);
-    if (ret_servo != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create servo task");
-        task_flag = 0;
-        oled_display_text("Error", "Servo task");
-        return;
-    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    show_face(&FACE_IDLE);
 
     ESP_LOGI(TAG, "=== Robot Dog Ready ===");
-    oled_display_text("Ready", "Say wakeword");
+    // app_main returns; FreeRTOS scheduler owns the CPU from here
 }
